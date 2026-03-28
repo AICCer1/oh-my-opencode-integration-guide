@@ -73,57 +73,287 @@ mcp:
 
 ### 3. Hooks（生命周期钩子）
 
-Hooks 是整个系统的"胶水层"，在关键时刻注入逻辑。
+先纠正一下：**不是**。我前面给你的“核心 Hooks 列表”只是代表性的核心项，**不是整个项目用到的完整列表**。
 
-#### 核心 Hooks 列表
+按源码看，`oh-my-opencode` 里和 Hooks 相关的东西可以分成 3 层：
 
-| Hook | 触发时机 | 作用 |
-|------|---------|------|
-| **todo-continuation-enforcer** | Agent 停止时 | 强制继续未完成任务（核心特性） |
-| **comment-checker** | 代码提交前 | 检查并清理 AI 生成的冗余注释 |
-| **context-window-monitor** | 每次对话 | 监控 context 使用率 |
-| **session-recovery** | 会话崩溃后 | 自动恢复会话状态 |
-| **tool-output-truncator** | 工具输出后 | 截断过长的 grep/LSP 输出 |
-| **directory-agents-injector** | 读取文件时 | 自动注入目录下的 AGENTS.md |
-| **rules-injector** | 读取文件时 | 根据 glob 模式注入规则 |
-| **background-notification** | 后台任务完成 | 通知主 agent |
-| **keyword-detector** | 用户输入后 | 检测 `ultrawork`/`ulw` 关键词 |
-| **claude-code-hooks** | 各个时机 | 兼容 Claude Code 的 hooks |
-| **ralph-loop** | 循环检测 | 防止 agent 陷入死循环 |
-| **atlas** | 任务开始时 | 编排系统（Prometheus/Metis/Momus） |
+1. **31 个可配置的内置 hooks / hook flags**（来自 `src/config/schema.ts` 的 `HookNameSchema`）
+2. **2 个内部始终启用的辅助 hook**（不在 `disabled_hooks` 里，但实际参与运行）
+3. **Claude Code 兼容层**（当前只兼容 5 个官方 Claude hook 事件）
 
-#### Hook 事件类型
+> 这意味着：如果你要把 oh-my-opencode 的行为集成到你自己的 agent 项目里，不能只照着 Claude Code 官方 hooks 文档来做；你还需要实现 oh-my-opencode 自己依赖的宿主事件。
 
-Hooks 监听这些事件：
-- `userPromptSubmit`: 用户提交 prompt
-- `preToolUse`: 工具调用前
-- `postToolUse`: 工具调用后
-- `stop`: Agent 停止时
-- `compaction`: Context 压缩时
+#### 3.1 全量 hook / hook flag 清单
 
-#### Hook 实现示例
+以下是 `src/config/schema.ts` 里可通过 `disabled_hooks` 控制的 **31 个名字**：
 
-```typescript
-export function createTodoContinuationEnforcer(options) {
-  return {
-    handler: async (input) => {
-      const { event } = input;
-      
-      if (event.type === 'stop') {
-        // 检查是否有未完成任务
-        const incompleteTodos = getIncompleteTodos();
-        if (incompleteTodos.length > 0) {
-          // 注入继续提示
-          injectContinuationPrompt();
-        }
-      }
-    }
-  };
-}
-```
+- `todo-continuation-enforcer`
+- `context-window-monitor`
+- `session-recovery`
+- `session-notification`
+- `comment-checker`
+- `grep-output-truncator`
+- `tool-output-truncator`
+- `directory-agents-injector`
+- `directory-readme-injector`
+- `empty-task-response-detector`
+- `think-mode`
+- `anthropic-context-window-limit-recovery`
+- `rules-injector`
+- `background-notification`
+- `auto-update-checker`
+- `startup-toast`
+- `keyword-detector`
+- `agent-usage-reminder`
+- `non-interactive-env`
+- `interactive-bash-session`
+- `thinking-block-validator`
+- `ralph-loop`
+- `compaction-context-injector`
+- `claude-code-hooks`
+- `auto-slash-command`
+- `edit-error-recovery`
+- `delegate-task-retry`
+- `prometheus-md-only`
+- `sisyphus-junior-notepad`
+- `start-work`
+- `atlas`
 
+另外还有 **2 个内部辅助 hook**，虽然不在 `disabled_hooks` 列表里，但实际参与运行：
 
----
+- `question-label-truncator`
+- `task-resume-info`
+
+#### 3.2 需要注意的“名字不等于独立 hook”
+
+这个项目里有几个名字会让人误会，得单独标出来：
+
+| 名字 | 实际情况 |
+|---|---|
+| `startup-toast` | 不是独立源码 hook，更像 `auto-update-checker` 的一个子功能开关 |
+| `grep-output-truncator` | 当前代码里主要由 `tool-output-truncator` 承担，文档/配置里保留了旧名字兼容 |
+| `preemptive-compaction` | 旧名字，已移除；迁移代码会把它过滤掉 |
+| `empty-message-sanitizer` | 旧名字，已移除 |
+
+#### 3.3 oh-my-opencode 真正依赖的宿主 hook 点
+
+从 `src/index.ts` 看，oh-my-opencode 不是只靠 Claude 风格 hooks 跑的，它依赖的是 OpenCode 插件宿主的这些 hook 点 / 生命周期：
+
+- `chat.message`
+- `tool.execute.before`
+- `tool.execute.after`
+- `event`（内部再分很多 event.type）
+- `experimental.session.compacting`
+- `experimental.chat.messages.transform`
+
+也就是说，如果你自己的 agent 框架里**没有这几类宿主事件**，你不能直接“兼容 oh-my-opencode hooks”，你得先把事件总线做出来。
+
+#### 3.4 按宿主事件分组的完整映射
+
+##### A. `chat.message`
+
+这一类基本对应“用户消息刚提交、模型还没真正处理前”的阶段。
+
+| hook / 模块 | 作用 | 更接近 Claude 哪个事件 |
+|---|---|---|
+| `keyword-detector` | 检测 `ultrawork` / `ulw` / `analyze` 等关键词并改写行为 | `UserPromptSubmit` |
+| `claude-code-hooks` | 执行 Claude Code 兼容层里的 `UserPromptSubmit` hooks | `UserPromptSubmit` |
+| `auto-slash-command` | 识别 `/xxx` 风格命令并改写 prompt | 无直接官方等价 |
+| `start-work` | 给 Sisyphus 注入启动工作流 | 无直接官方等价 |
+| `ralph-loop` | 检测并启动 Ralph Loop | 无直接官方等价 |
+
+##### B. `tool.execute.before`
+
+这一类对应“工具调用真正执行前”。这是最接近 Claude `PreToolUse` 的一层。
+
+| hook / 模块 | 作用 | 对应 Claude |
+|---|---|---|
+| `question-label-truncator`（内部） | 截断过长问题标签 | 无直接官方等价 |
+| `claude-code-hooks` | 执行 `PreToolUse` | `PreToolUse` |
+| `non-interactive-env` | 处理无 TTY / 非交互环境 | `PreToolUse` 的内部策略化扩展 |
+| `comment-checker`（before 半段） | 提前记录上下文，准备检查注释 | `PreToolUse` / 内部前置准备 |
+| `directory-agents-injector` | 在文件/目录访问前注入 AGENTS.md | 更接近 `InstructionsLoaded`，但不是官方实现 |
+| `directory-readme-injector` | 注入 README.md | 更接近 `InstructionsLoaded`，但不是官方实现 |
+| `rules-injector` | 按 glob 注入规则 | 更接近 `InstructionsLoaded`，但不是官方实现 |
+| `prometheus-md-only` | 对 planner 的工具使用施加限制 | 无直接官方等价 |
+| `sisyphus-junior-notepad` | 给特定 agent 附加行为 | 无直接官方等价 |
+| `atlas` | 编排器在工具前做状态干预 | 无直接官方等价 |
+
+##### C. `tool.execute.after`
+
+这一类对应“工具调用成功返回后”。最接近 Claude `PostToolUse`。
+
+| hook / 模块 | 作用 | 对应 Claude |
+|---|---|---|
+| `claude-code-hooks` | 执行 `PostToolUse` | `PostToolUse` |
+| `tool-output-truncator` | 截断工具输出，防 context 爆炸 | `PostToolUse` |
+| `context-window-monitor` | 在工具返回后检查 context headroom | `PostToolUse` |
+| `comment-checker`（after 半段） | 检查变更是否引入 AI 注释污染 | `PostToolUse` |
+| `directory-agents-injector` | 清理/补充目录注入状态 | 内部扩展 |
+| `directory-readme-injector` | 清理/补充 README 注入状态 | 内部扩展 |
+| `rules-injector` | 清理/补充规则注入状态 | 内部扩展 |
+| `empty-task-response-detector` | 检测 task 工具返回空结果 | 无直接官方等价 |
+| `agent-usage-reminder` | 在合适时提醒使用专家 agent | `PostToolUse` 风格提醒 |
+| `interactive-bash-session` | 跟踪交互式 shell / tmux 会话状态 | 无直接官方等价 |
+| `edit-error-recovery` | Edit 工具失败后的恢复逻辑 | 更接近 `PostToolUseFailure` 的内部替代 |
+| `delegate-task-retry` | delegate_task 失败时自动重试 | 无直接官方等价 |
+| `atlas` | 编排器在工具后更新状态 | 无直接官方等价 |
+| `task-resume-info`（内部） | 给 task 连续执行提供恢复信息 | 无直接官方等价 |
+
+##### D. `event`
+
+这是 oh-my-opencode 很关键的一层。很多“看起来像 hook”的功能，其实并不是挂在 Claude 式的 5 个 hook 上，而是监听内部 runtime event。
+
+常见 `event.type` 包括：
+
+- `session.created`
+- `session.updated`
+- `session.deleted`
+- `session.error`
+- `message.created`
+- `message.updated`
+- `tool.execute.before`
+- `tool.execute.after`
+
+依赖这层的模块包括：
+
+| hook / 模块 | 依赖的内部事件 | 作用 | 对应 Claude |
+|---|---|---|---|
+| `auto-update-checker` | `session.created` | 启动时检查更新 / toast | 最接近 `SessionStart` |
+| `background-notification` | 后台任务管理事件 | 后台 agent 完成时通知 | 最接近 `Notification`，但不是 Claude 官方实现 |
+| `session-notification` | `session.created/updated`、`message.created/updated`、`tool.execute.*`、`session.deleted` | 会话空闲/恢复时发系统通知 | 最接近 `Notification` / `TeammateIdle`，但不是官方实现 |
+| `todo-continuation-enforcer` | `session.error`、`message.updated`、`tool.execute.*`、`session.deleted` | 任务未完成时自动续跑 | 最接近 `Stop` + `StopFailure` 的组合替代 |
+| `context-window-monitor` | event 总线 + 工具后 | 监控 token headroom | 无直接官方等价 |
+| `directory-agents-injector` | `session.deleted` 等 | 清理目录注入缓存 | 无直接官方等价 |
+| `directory-readme-injector` | `session.deleted` 等 | 清理 README 注入缓存 | 无直接官方等价 |
+| `rules-injector` | `session.deleted` 等 | 清理规则缓存 | 更接近 `InstructionsLoaded` 配套缓存 |
+| `think-mode` | `session.deleted` 等 | 管理 thinking mode 状态 | 无直接官方等价 |
+| `anthropic-context-window-limit-recovery` | session 级错误 / 停止相关 | 自动恢复超上下文错误 | 最接近 `StopFailure` 的恢复策略 |
+| `agent-usage-reminder` | `session.deleted` 等 | 维护提醒状态 | 无直接官方等价 |
+| `interactive-bash-session` | `session.deleted` 等 | 清理交互式 bash 状态 | 无直接官方等价 |
+| `ralph-loop` | `session.error`、`session.deleted` | 管理 loop 生命周期 | 无直接官方等价 |
+| `atlas` | `session.error`、`message.updated`、`session.deleted`、`tool.execute.*` | 主编排器状态机 | 无直接官方等价 |
+| `session-recovery`（核心插件逻辑中手动调用） | `session.error` | 会话异常恢复 | 最接近 `StopFailure` |
+| `claude-code-hooks`（部分状态管理） | `session.error`、`session.deleted` | 为 Claude Stop/interrupt 兼容层维护状态 | `Stop` / `StopFailure` 配套 |
+
+##### E. `experimental.session.compacting`
+
+| hook / 模块 | 作用 | 对应 Claude |
+|---|---|---|
+| `claude-code-hooks` | 执行 Claude `PreCompact` hooks | `PreCompact` |
+| `compaction-context-injector` | 在压缩前补上下文 | `PreCompact` 的内部增强 |
+
+##### F. `experimental.chat.messages.transform`
+
+| hook / 模块 | 作用 | 对应 Claude |
+|---|---|---|
+| `thinking-block-validator` | 校验 `<thinking>` block，防 API 错误 | 无直接官方等价 |
+| `context injector`（功能模块，不在 disabled_hooks） | 调整 message 注入上下文 | 无直接官方等价 |
+
+#### 3.5 和 Claude Code 官方 hooks 的逐项对比
+
+Claude 官方文档里的 hook 事件比 oh-my-opencode 当前兼容层要大得多。**oh-my-opencode 当前真正显式兼容的只有 5 个 Claude 官方事件**：
+
+- `UserPromptSubmit`
+- `PreToolUse`
+- `PostToolUse`
+- `Stop`
+- `PreCompact`
+
+下面是逐项对比：
+
+| Claude 官方事件 | oh-my-opencode 当前状态 | 你自己的项目若想兼容，需要什么 |
+|---|---|---|
+| `SessionStart` | **未直接实现 Claude 兼容 hook**；内部最接近 `session.created` | 需要 session 生命周期事件 |
+| `UserPromptSubmit` | **已实现**（通过 `chat.message`） | 需要“用户 prompt 提交前”钩子 |
+| `PreToolUse` | **已实现**（通过 `tool.execute.before`） | 需要工具调用前钩子 |
+| `PermissionRequest` | **未实现** | 如果你有权限弹窗/审批系统，要单独做 |
+| `PostToolUse` | **已实现**（通过 `tool.execute.after`） | 需要工具成功后钩子 |
+| `PostToolUseFailure` | **未显式实现 Claude 兼容层**；内部有 `edit-error-recovery` 和 `session.error` 风格恢复 | 如果你想完整对齐 Claude，最好单独补一个失败后钩子 |
+| `Notification` | **未直接实现 Claude 兼容 hook**；内部有 `background-notification` / `session-notification` | 需要通知事件总线 |
+| `SubagentStart` | **未实现 Claude 兼容 hook** | 如果你有子 agent，要补子 agent 生命周期事件 |
+| `SubagentStop` | **未实现 Claude 兼容 hook** | 同上 |
+| `TaskCreated` | **未实现 Claude 兼容 hook** | 如果你有 task API，要补 task 生命周期事件 |
+| `TaskCompleted` | **未实现 Claude 兼容 hook** | 同上 |
+| `Stop` | **已实现** | 需要“本轮 assistant 响应结束/即将 idle”事件 |
+| `StopFailure` | **未显式实现 Claude 兼容 hook**；内部最接近 `session.error` | 建议补独立失败结束事件 |
+| `TeammateIdle` | **未实现 Claude 兼容 hook** | 如果你有 agent team，建议补 |
+| `InstructionsLoaded` | **未直接实现 Claude 兼容 hook**；内部近似物是 `directory-agents-injector` / `rules-injector` | 需要“规则/说明文件加载”事件 |
+| `ConfigChange` | **未实现** | 需要配置变更事件 |
+| `CwdChanged` | **未实现** | 需要工作目录切换事件 |
+| `FileChanged` | **未实现** | 需要文件 watch 事件 |
+| `WorktreeCreate` | **未实现** | 若支持 worktree，需单独补 |
+| `WorktreeRemove` | **未实现** | 同上 |
+| `PreCompact` | **已实现**（通过 `experimental.session.compacting`） | 需要 compaction 前事件 |
+| `PostCompact` | **未实现** | 如果你做 compaction，建议补 |
+| `Elicitation` | **未实现** | 如果你支持 MCP elicitation，要单独做 |
+| `ElicitationResult` | **未实现** | 同上 |
+| `SessionEnd` | **未直接实现 Claude 兼容 hook**；内部最接近 `session.deleted` | 需要 session 结束事件 |
+
+#### 3.6 结论：你自己的 agent 项目最少要实现哪些 hooks 事件？
+
+如果你的目标是：**先把 oh-my-opencode 里最有价值的能力接进来**，而不是 100% 复刻 Claude Code 官方 hooks，全局上我建议你至少先做这 **6 类宿主事件**：
+
+1. `chat.message`
+   - 支撑：`keyword-detector`、`start-work`、`auto-slash-command`
+   - 也能映射 Claude `UserPromptSubmit`
+
+2. `tool.execute.before`
+   - 支撑：`claude-code-hooks(PreToolUse)`、`directory-agents-injector`、`rules-injector`、`non-interactive-env`
+
+3. `tool.execute.after`
+   - 支撑：`tool-output-truncator`、`comment-checker`、`edit-error-recovery`、`delegate-task-retry`
+   - 也能映射 Claude `PostToolUse`
+
+4. `event` 总线（至少这些事件类型）
+   - `session.created`
+   - `session.updated`
+   - `session.deleted`
+   - `session.error`
+   - `message.created`
+   - `message.updated`
+   - 支撑：`todo-continuation-enforcer`、`session-recovery`、`session-notification`、`atlas`
+
+5. `experimental.session.compacting`
+   - 支撑 Claude `PreCompact`
+   - 支撑 `compaction-context-injector`
+
+6. `experimental.chat.messages.transform`
+   - 支撑 `thinking-block-validator`
+   - 这个不是 Claude 官方 hooks，但 oh-my-opencode 自己会用
+
+如果你的目标是：**让用户在你自己的项目里也能直接使用 Claude Code 风格 hooks 配置**，那你至少要补齐下面这 **5 个 Claude 官方事件**，因为 oh-my-opencode 当前兼容层就是围绕它们写的：
+
+- `UserPromptSubmit`
+- `PreToolUse`
+- `PostToolUse`
+- `Stop`
+- `PreCompact`
+
+#### 3.7 推荐实现顺序
+
+我建议按这个顺序来，不容易把自己写死：
+
+1. **先做宿主级事件**：`chat.message` / `tool.execute.before` / `tool.execute.after` / `event`
+2. **再做 session 级状态事件**：`session.created` / `session.deleted` / `session.error` / `message.updated`
+3. **再补 Claude 兼容层**：`UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop` / `PreCompact`
+4. **最后补增强事件**：`PostToolUseFailure` / `SessionStart` / `SessionEnd` / `InstructionsLoaded` / `PostCompact`
+
+一句话总结：
+
+- **如果你只想跑 oh-my-opencode 的核心价值**：先实现它依赖的宿主事件
+- **如果你还想吃 Claude Code hooks 生态**：再把官方事件名和输入输出协议兼容上
+- **今天这个项目本身并没有完整实现 Claude 官方全部 hook 生命周期**，它只覆盖了其中最关键的 5 个
+
+#### 3.8 对照依据
+
+这部分对照主要基于以下源码/文档：
+
+- `oh-my-opencode/src/config/schema.ts`：可配置 hook 名单（`HookNameSchema`）
+- `oh-my-opencode/src/index.ts`：宿主 hook 点注册（`chat.message` / `tool.execute.before` / `tool.execute.after` / `event` / `experimental.*`）
+- `oh-my-opencode/src/hooks/AGENTS.md`：hooks 模块概览
+- `oh-my-opencode/src/hooks/claude-code-hooks/AGENTS.md`：Claude 兼容层说明
+- Claude Code 官方 Hooks 文档：<https://code.claude.com/docs/en/hooks>
 
 ### 4. MCPs（Model Context Protocol）
 
