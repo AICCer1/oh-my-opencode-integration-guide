@@ -330,7 +330,183 @@ Claude 官方文档里的 hook 事件比 oh-my-opencode 当前兼容层要大得
 - `Stop`
 - `PreCompact`
 
-#### 3.7 推荐实现顺序
+#### 3.7 你真正需要实现的：宿主事件 → hooks 覆盖表
+
+如果你是从工程实现角度看，这里最重要的不是记 31 个名字，而是明确：
+
+> **一个宿主事件，会扇出覆盖多个 hooks**。
+
+你自己的 agent 项目里，建议按下面这个映射来设计。
+
+##### A. 用户提交信息后（可命名为 `onUserPromptSubmit` / `chat.message`）
+
+**会覆盖的 hooks：**
+- `keyword-detector`
+- `claude-code-hooks(UserPromptSubmit)`
+- `auto-slash-command`
+- `start-work`
+- `ralph-loop`
+
+**作用：**
+- 识别 `ultrawork` / `ulw` 关键词
+- 执行 Claude 风格的 `UserPromptSubmit`
+- 识别 `/command` 风格命令
+- 启动特定工作流
+
+##### B. 工具调用前（可命名为 `onBeforeToolUse` / `tool.execute.before`）
+
+**会覆盖的 hooks：**
+- `question-label-truncator`（内部辅助）
+- `claude-code-hooks(PreToolUse)`
+- `non-interactive-env`
+- `comment-checker`（前置阶段）
+- `directory-agents-injector`
+- `directory-readme-injector`
+- `rules-injector`
+- `prometheus-md-only`
+- `sisyphus-junior-notepad`
+- `atlas`
+
+**作用：**
+- Claude 风格 `PreToolUse`
+- 在读文件/读目录前注入规则和上下文
+- 对特定 agent 或特定工具调用加限制
+- 在真正执行工具前做宿主级预处理
+
+##### C. 工具调用后（可命名为 `onAfterToolUse` / `tool.execute.after`）
+
+**会覆盖的 hooks：**
+- `claude-code-hooks(PostToolUse)`
+- `tool-output-truncator`
+- `context-window-monitor`
+- `comment-checker`（后置阶段）
+- `directory-agents-injector`
+- `directory-readme-injector`
+- `rules-injector`
+- `empty-task-response-detector`
+- `agent-usage-reminder`
+- `interactive-bash-session`
+- `edit-error-recovery`
+- `delegate-task-retry`
+- `atlas`
+- `task-resume-info`（内部辅助）
+
+**作用：**
+- Claude 风格 `PostToolUse`
+- 截断工具输出，控制上下文体积
+- 检查编辑结果、注释污染、空 task 返回
+- 失败自动恢复 / 自动重试 / 状态推进
+
+##### D. 本轮响应结束 / 即将 idle（可命名为 `onTurnStop`）
+
+**会覆盖的 hooks：**
+- `claude-code-hooks(Stop)`
+- `todo-continuation-enforcer`
+- `session-notification`
+
+**作用：**
+- Claude 风格 `Stop`
+- 任务没做完时自动续跑
+- agent 空闲时通知用户
+
+> 这个事件很关键。没有它，`todo-continuation-enforcer` 基本跑不起来。
+
+##### E. 会话开始 / 恢复（可命名为 `onSessionStart`）
+
+**会覆盖的 hooks / 行为：**
+- `auto-update-checker`
+- `session-notification`（初始化）
+- `atlas`（初始化）
+
+**作用：**
+- 初始化 session 级状态
+- 启动时检查更新和提示
+- 初始化编排器状态
+
+##### F. 会话异常 / 本轮失败（可命名为 `onSessionError`）
+
+**会覆盖的 hooks：**
+- `session-recovery`
+- `anthropic-context-window-limit-recovery`
+- `todo-continuation-enforcer`
+- `atlas`
+- `ralph-loop`
+- `claude-code-hooks`（Stop/interrupt 兼容状态）
+
+**作用：**
+- 做异常恢复
+- 上下文窗口超限时恢复
+- 避免错误导致任务半路烂尾
+
+##### G. 会话结束（可命名为 `onSessionEnd` / `session.deleted`）
+
+**会覆盖的 hooks / 状态清理：**
+- `session-notification`
+- `directory-agents-injector`
+- `directory-readme-injector`
+- `rules-injector`
+- `think-mode`
+- `interactive-bash-session`
+- `ralph-loop`
+- `atlas`
+- `todo-continuation-enforcer`
+- `agent-usage-reminder`
+
+**作用：**
+- 清理缓存
+- 清理 session 级状态
+- 清理 loop / tmux / 通知状态
+
+##### H. 压缩前（可命名为 `onPreCompact` / `experimental.session.compacting`）
+
+**会覆盖的 hooks：**
+- `claude-code-hooks(PreCompact)`
+- `compaction-context-injector`
+
+**作用：**
+- Claude 风格 `PreCompact`
+- 在压缩前补关键上下文
+
+##### I. 消息发送前 transform（可命名为 `transformMessages`）
+
+**会覆盖的 hooks / 模块：**
+- `thinking-block-validator`
+- `context injector`（内部功能模块）
+
+**作用：**
+- 在消息真正发给模型前做最终修正
+- 防止 `<thinking>` block 导致 API 错误
+
+##### J. 内部 runtime event bus（必须有）
+
+除了上面这些显式 hook 点，你自己的宿主最好还要有一个事件总线，至少能发这些事件：
+
+- `session.created`
+- `session.updated`
+- `session.deleted`
+- `session.error`
+- `message.created`
+- `message.updated`
+- `tool.execute.before`
+- `tool.execute.after`
+
+因为 `todo-continuation-enforcer`、`session-notification`、`atlas`、`session-recovery` 这些关键能力，并不只是靠 Claude 风格 hooks 跑，而是同时依赖内部 runtime event。
+
+##### K. 一张最短总结表
+
+| 你自己的宿主事件 | 能覆盖的主要 hooks |
+|---|---|
+| 用户提交信息后 | `keyword-detector`, `claude-code-hooks(UserPromptSubmit)`, `auto-slash-command`, `start-work`, `ralph-loop` |
+| 工具调用前 | `claude-code-hooks(PreToolUse)`, `non-interactive-env`, `comment-checker(pre)`, `directory-agents-injector`, `directory-readme-injector`, `rules-injector`, `prometheus-md-only`, `sisyphus-junior-notepad`, `atlas` |
+| 工具调用后 | `claude-code-hooks(PostToolUse)`, `tool-output-truncator`, `context-window-monitor`, `comment-checker(post)`, `empty-task-response-detector`, `agent-usage-reminder`, `interactive-bash-session`, `edit-error-recovery`, `delegate-task-retry`, `atlas` |
+| 本轮停止 / idle | `claude-code-hooks(Stop)`, `todo-continuation-enforcer`, `session-notification` |
+| 会话开始 / 恢复 | `auto-update-checker`, `session-notification(init)`, `atlas(init)` |
+| 会话异常 | `session-recovery`, `anthropic-context-window-limit-recovery`, `todo-continuation-enforcer`, `atlas`, `ralph-loop` |
+| 会话结束 | 各种状态清理类 hooks |
+| 压缩前 | `claude-code-hooks(PreCompact)`, `compaction-context-injector` |
+| messages transform | `thinking-block-validator` |
+
+#### 3.8 推荐实现顺序
 
 我建议按这个顺序来，不容易把自己写死：
 
@@ -345,7 +521,7 @@ Claude 官方文档里的 hook 事件比 oh-my-opencode 当前兼容层要大得
 - **如果你还想吃 Claude Code hooks 生态**：再把官方事件名和输入输出协议兼容上
 - **今天这个项目本身并没有完整实现 Claude 官方全部 hook 生命周期**，它只覆盖了其中最关键的 5 个
 
-#### 3.8 对照依据
+#### 3.9 对照依据
 
 这部分对照主要基于以下源码/文档：
 
